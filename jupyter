@@ -1,0 +1,2256 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Tensorflow error debug"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from functools import reduce\n",
+    "import random\n",
+    "from multiprocessing import Pool\n",
+    "import tensorflow as tf\n",
+    "import swifter\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import tensorflow as tf\n",
+    "from functools import reduce\n",
+    "tf.enable_eager_execution()\n",
+    "from query_cnn import get_estimator\n",
+    "from collections import Counter\n",
+    "from config import config\n",
+    "from tqdm import tqdm"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# generate test file"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tquery = pd.read_csv(\"top100K_26JulyOnwards.csv\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "from tensorflow import keras\n",
+    "from query_nn_keras_small_multi import get_keras_model\n",
+    "l3 = pd.read_csv(\"gs://gcp-ushi-search-platform-npe/ashwin/dev/cats.csv\", header=None, names=[\"leafId\"])\n",
+    "civm = pd.read_csv(\"./model_file/ivm-cat.csv\")\n",
+    "clabel = 3026"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pd.set_option('display.max_colwidth', -1)\n",
+    "l3c = pd.merge(l3, civm[[\"Departments_Depth\", \"leafId\"]], on =\"leafId\", how=\"left\").drop_duplicates()\n",
+    "l3c[\"Departments_Depth\"] = [str(x).split(\",\")[-1] for x in l3c[\"Departments_Depth\"]]\n",
+    "l3c = l3c.reset_index(drop=True)\n",
+    "l3c.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model = get_keras_model(None, label_cnt=clabel)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(\"./model_file/glove.42B.tokens.txt\") as f:\n",
+    "    glove_token = f.read().split(\"\\n\")\n",
+    "    \n",
+    "tmapper = dict([(t, k) for k, t in enumerate(glove_token)])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import re\n",
+    "X = np.zeros((tquery.shape[0], 10))\n",
+    "with tqdm(enumerate(tquery[\"query\"])) as iter_:\n",
+    "    for i, query in iter_:\n",
+    "        query = query.replace('\\\\', \"\").replace(\"/\", \" \").replace(\"'\", \"\").replace('\"', \"\")\n",
+    "        query = [x.strip().lower() for x in re.split(r\"[\\s-]\", query) if x != \"\"]\n",
+    "        vec = []\n",
+    "        for k, q in enumerate(query[:10]):\n",
+    "            X[i, k] = tmapper.get(q, 0)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "prediction = model.predict(X, batch_size=1024)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pred_index = np.where(prediction > 0.1)\n",
+    "pred_index = list(zip(*pred_index))\n",
+    "pred_index = [(a, b,\n",
+    "               prediction[a, b],\n",
+    "               tquery.loc[a, \"query\"],\n",
+    "               l3c.loc[b, \"leafId\"],\n",
+    "               l3c.loc[b, \"Departments_Depth\"]\n",
+    "               ) for a,b in pred_index]\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pred_index = pd.DataFrame(pred_index, columns=[\"source\", \"target\", \"score\", \"query\", \"catid\", \"department\"])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "pd.set_option('display.max_colwidth', -1)\n",
+    "pred_index.head(20)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pred_index[[\"query\", \"department\", \"score\"]].to_csv(\"qcs-test-file-glove.csv\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Catalogue data "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data = pd.read_csv(\"./model_file/train_data_multi_l4/part-00000-506780a4-0c06-49ba-9f37-0d10a5c3f2b3-c000.csv\",\n",
+    "                        header=None, names=[\"query\", \"freq\", \"label\"])\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "catalogue = pd.read_csv(\"gs://gcp-ushi-search-platform-multi-npe-data/relevancy_data/qcs/catalogue_training_data.csv\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import json\n",
+    "with open(\"./model_file/nvaluesMapping.json\", \"r\") as f:\n",
+    "    nmap = json.load(f)\n",
+    "facet = [x for x in nmap if x[\"facetType\"] == \"DEPARTMENT\"]\n",
+    "facet_map = dict([(x[\"value\"], x[\"categoryId\"]) for x in facet])\n",
+    "\n",
+    "with open(\"./model_file/dep-catid.json\", \"w\") as f:\n",
+    "    json.dump(facet_map, f) "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [],
+   "source": [
+    "import re\n",
+    "l3 = pd.read_csv(\"gs://gcp-ushi-search-platform-npe/ashwin/dev/cats.csv\", header=None, names=[\"leafId\"])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "(459,)\n"
+     ]
+    }
+   ],
+   "source": [
+    "catalogue[\"leafID\"] = [facet_map.get(x) for x in catalogue[\"normdep\"]]\n",
+    "print(catalogue[catalogue.leafID.isna()].normdep.unique().shape)\n",
+    "catalogue = catalogue[~catalogue[\"leafID\"].isna()].reset_index(drop=True)\n",
+    "print(catalogue.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 45,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data[\"label\"] = [[int(float(i.split(\":\")[0])) for i in x.split(\"|\") if float(i.split(\":\")[-1]) > 0.1] \n",
+    "                       for x in train_data[\"label\"]]\n",
+    "l3list = l3[\"leafId\"].to_list()\n",
+    "train_data[\"leafId\"] = [ [l3list[y] for y in x] for x in train_data[\"label\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 58,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "1217"
+      ]
+     },
+     "execution_count": 58,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(set([str(x) for x in l3list]) - set(catalogue.leafID.unique().tolist()))\n",
+    "len(set(catalogue.leafID.unique().tolist()) - set([str(x) for x in l3list]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 57,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "((20905030,), (20905131, 4))"
+      ]
+     },
+     "execution_count": 57,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train_data[\"query\"].unique().shape, train_data.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 59,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "((20905029,), (20905029, 4))"
+      ]
+     },
+     "execution_count": 59,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train_data = train_data.drop_duplicates(subset=\"query\")\n",
+    "train_data = train_data[~train_data[\"query\"].isna()].reset_index(drop=True)\n",
+    "train_data[\"query\"].unique().shape, train_data.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data[[len(x) > 1 for x in train_data[\"label\"]]].shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 63,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "leafs = list(set(catalogue.leafID.unique().tolist()) | set([str(x) for x in l3list]))\n",
+    "leafs = dict([(l, k) for k, l in enumerate(leafs)])\n",
+    "with open(\"./model_file/leafID-label.json\", \"w\") as f:\n",
+    "    json.dump(leafs, f)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 62,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "3589"
+      ]
+     },
+     "execution_count": 62,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(leafs)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 66,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data[\"type\"] = \"query\"\n",
+    "catalogue = catalogue.rename(columns={\"leafID\": \"leafId\"})\n",
+    "catalogue[\"type\"] = \"catalogue\""
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 69,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train = pd.concat([train_data[[\"query\", \"leafId\", \"type\"]], catalogue[[\"query\", \"leafId\", \"type\"]]]).reset_index(drop=True)\n",
+    "train.loc[train[\"type\"] == \"catalogue\", \"leafId\"] = [[x] for x in train.loc[train[\"type\"] == \"catalogue\", \"leafId\"]]\n",
+    "train[\"labels\"] = [[leafs[str(y)] for y in x] for x in train[\"leafId\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 182,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train[\"query\"] = [\" \".join(x.split()[:45]) for x in train[\"query\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train[\"target\"] = [x[0] for x in train[\"labels\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 181,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(22602794, 5)"
+      ]
+     },
+     "execution_count": 181,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 193,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 2773399/2773399 [21:45<00:00, 2124.32it/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "new_df = []\n",
+    "with tqdm(train[[len(x) > 1 for x in train[\"labels\"]]].index) as iter_:\n",
+    "    for i in iter_:\n",
+    "        pload = df.loc[i, :].to_list()\n",
+    "        for x in df.loc[i, \"labels\"][1:]:\n",
+    "            pload = train.loc[i, :].to_list()\n",
+    "            pload[-1] = x\n",
+    "            new_df.append(pload)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 194,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "4821253"
+      ]
+     },
+     "execution_count": 194,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(new_df)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 196,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "new_df = pd.DataFrame(new_df, columns=[\"query\", \"leafId\", \"type\", \"labels\", \"target\"])\n",
+    "train = pd.concat([train, new_df]).reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 199,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train = train.sort_values(\"query\").reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 202,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train.to_csv(\"gs://gcp-ushi-search-platform-multi-npe-data/relevancy_data/qcs/qcs_training_data.csv\", index=False)\n",
+    "train.to_csv(\"./model_file/qcs_training_data.csv\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 107,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>query</th>\n",
+       "      <th>leafId</th>\n",
+       "      <th>type</th>\n",
+       "      <th>labels</th>\n",
+       "      <th>target</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>\\1/4\\\" npt\"</td>\n",
+       "      <td>[103016, 100585]</td>\n",
+       "      <td>query</td>\n",
+       "      <td>[454, 1143]</td>\n",
+       "      <td>454</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>\\1/4\\\" pipe nipples brass\"</td>\n",
+       "      <td>[104100]</td>\n",
+       "      <td>query</td>\n",
+       "      <td>[1384]</td>\n",
+       "      <td>1384</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>\\24\\\" inch wide beverage refrigerator\"</td>\n",
+       "      <td>[100321]</td>\n",
+       "      <td>query</td>\n",
+       "      <td>[1138]</td>\n",
+       "      <td>1138</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>\\3/4\\\" osb\"</td>\n",
+       "      <td>[204623]</td>\n",
+       "      <td>query</td>\n",
+       "      <td>[1918]</td>\n",
+       "      <td>1918</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>\\3000 psi\\\" \\\"electric\\\" \\\"pressure washers\\\"\"</td>\n",
+       "      <td>[104071]</td>\n",
+       "      <td>query</td>\n",
+       "      <td>[2864]</td>\n",
+       "      <td>2864</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                                            query            leafId   type  \\\n",
+       "0                                     \\1/4\\\" npt\"  [103016, 100585]  query   \n",
+       "1                      \\1/4\\\" pipe nipples brass\"          [104100]  query   \n",
+       "2          \\24\\\" inch wide beverage refrigerator\"          [100321]  query   \n",
+       "3                                     \\3/4\\\" osb\"          [204623]  query   \n",
+       "4  \\3000 psi\\\" \\\"electric\\\" \\\"pressure washers\\\"\"          [104071]  query   \n",
+       "\n",
+       "        labels  target  \n",
+       "0  [454, 1143]     454  \n",
+       "1       [1384]    1384  \n",
+       "2       [1138]    1138  \n",
+       "3       [1918]    1918  \n",
+       "4       [2864]    2864  "
+      ]
+     },
+     "execution_count": 107,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "train.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 203,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tagg = train[[\"query\", \"target\"]].groupby(\"target\").count().reset_index(drop=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 204,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "m, s = tagg[\"query\"].describe()[[\"mean\", \"std\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 205,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tagg[\"norm\"] = (tagg[\"query\"] - m)/s\n",
+    "tagg[\"mm\"] = np.log(tagg[\"query\"]) / np.log(tagg[\"query\"]).max()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 207,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>target</th>\n",
+       "      <th>query</th>\n",
+       "      <th>norm</th>\n",
+       "      <th>mm</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>2424</th>\n",
+       "      <td>2427</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1715</th>\n",
+       "      <td>1716</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3229</th>\n",
+       "      <td>3232</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>139</th>\n",
+       "      <td>139</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>376</th>\n",
+       "      <td>376</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2982</th>\n",
+       "      <td>2985</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2338</th>\n",
+       "      <td>2341</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3281</th>\n",
+       "      <td>3284</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3555</th>\n",
+       "      <td>3558</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1238</th>\n",
+       "      <td>1238</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3406</th>\n",
+       "      <td>3409</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3291</th>\n",
+       "      <td>3294</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1604</th>\n",
+       "      <td>1605</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>248</th>\n",
+       "      <td>248</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1559</th>\n",
+       "      <td>1560</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1649</th>\n",
+       "      <td>1650</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>472</th>\n",
+       "      <td>472</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2301</th>\n",
+       "      <td>2304</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>181</th>\n",
+       "      <td>181</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>95</th>\n",
+       "      <td>95</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2169</th>\n",
+       "      <td>2171</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2395</th>\n",
+       "      <td>2398</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3528</th>\n",
+       "      <td>3531</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3240</th>\n",
+       "      <td>3243</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3432</th>\n",
+       "      <td>3435</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2160</th>\n",
+       "      <td>2162</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1424</th>\n",
+       "      <td>1424</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1444</th>\n",
+       "      <td>1444</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2374</th>\n",
+       "      <td>2377</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3346</th>\n",
+       "      <td>3349</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2862</th>\n",
+       "      <td>2865</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3537</th>\n",
+       "      <td>3540</td>\n",
+       "      <td>1</td>\n",
+       "      <td>-0.400771</td>\n",
+       "      <td>0.000000</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1806</th>\n",
+       "      <td>1807</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1603</th>\n",
+       "      <td>1604</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3246</th>\n",
+       "      <td>3249</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1748</th>\n",
+       "      <td>1749</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1243</th>\n",
+       "      <td>1243</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1039</th>\n",
+       "      <td>1039</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3230</th>\n",
+       "      <td>3233</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1569</th>\n",
+       "      <td>1570</td>\n",
+       "      <td>2</td>\n",
+       "      <td>-0.400719</td>\n",
+       "      <td>0.053894</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "      target  query      norm        mm\n",
+       "2424    2427      1 -0.400771  0.000000\n",
+       "1715    1716      1 -0.400771  0.000000\n",
+       "3229    3232      1 -0.400771  0.000000\n",
+       "139      139      1 -0.400771  0.000000\n",
+       "376      376      1 -0.400771  0.000000\n",
+       "2982    2985      1 -0.400771  0.000000\n",
+       "2338    2341      1 -0.400771  0.000000\n",
+       "3281    3284      1 -0.400771  0.000000\n",
+       "3555    3558      1 -0.400771  0.000000\n",
+       "1238    1238      1 -0.400771  0.000000\n",
+       "3406    3409      1 -0.400771  0.000000\n",
+       "3291    3294      1 -0.400771  0.000000\n",
+       "1604    1605      1 -0.400771  0.000000\n",
+       "248      248      1 -0.400771  0.000000\n",
+       "1559    1560      1 -0.400771  0.000000\n",
+       "1649    1650      1 -0.400771  0.000000\n",
+       "472      472      1 -0.400771  0.000000\n",
+       "2301    2304      1 -0.400771  0.000000\n",
+       "181      181      1 -0.400771  0.000000\n",
+       "95        95      1 -0.400771  0.000000\n",
+       "2169    2171      1 -0.400771  0.000000\n",
+       "2395    2398      1 -0.400771  0.000000\n",
+       "3528    3531      1 -0.400771  0.000000\n",
+       "3240    3243      1 -0.400771  0.000000\n",
+       "3432    3435      1 -0.400771  0.000000\n",
+       "2160    2162      1 -0.400771  0.000000\n",
+       "1424    1424      1 -0.400771  0.000000\n",
+       "1444    1444      1 -0.400771  0.000000\n",
+       "2374    2377      1 -0.400771  0.000000\n",
+       "3346    3349      1 -0.400771  0.000000\n",
+       "2862    2865      1 -0.400771  0.000000\n",
+       "3537    3540      1 -0.400771  0.000000\n",
+       "1806    1807      2 -0.400719  0.053894\n",
+       "1603    1604      2 -0.400719  0.053894\n",
+       "3246    3249      2 -0.400719  0.053894\n",
+       "1748    1749      2 -0.400719  0.053894\n",
+       "1243    1243      2 -0.400719  0.053894\n",
+       "1039    1039      2 -0.400719  0.053894\n",
+       "3230    3233      2 -0.400719  0.053894\n",
+       "1569    1570      2 -0.400719  0.053894"
+      ]
+     },
+     "execution_count": 207,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "tagg.sort_values(\"mm\", ascending=True)[0:40]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# dataloader catalogue"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 220,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = train"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 221,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = df.reset_index()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 222,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "target_map = df[[\"index\", \"target\"]]\n",
+    "target_map = target_map.groupby(\"target\").agg({\"index\": list})"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 224,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>index</th>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>target</th>\n",
+       "      <th></th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>[5753260, 7163302, 11077208, 11077209, 1107721...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>[11948, 48045, 50648, 65352, 68558, 113409, 11...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>[13541698, 13541699, 13541701, 13541706, 13541...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>[19291, 34375, 34412, 34973, 37361, 40468, 415...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>[10371, 12329, 12898, 13127, 17716, 20325, 228...</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                                                    index\n",
+       "target                                                   \n",
+       "0       [5753260, 7163302, 11077208, 11077209, 1107721...\n",
+       "1       [11948, 48045, 50648, 65352, 68558, 113409, 11...\n",
+       "2       [13541698, 13541699, 13541701, 13541706, 13541...\n",
+       "3       [19291, 34375, 34412, 34973, 37361, 40468, 415...\n",
+       "4       [10371, 12329, 12898, 13127, 17716, 20325, 228..."
+      ]
+     },
+     "execution_count": 224,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "target_map.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 226,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "((3586, 1), 3589)"
+      ]
+     },
+     "execution_count": 226,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "target_map.shape, len(lid)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 231,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "      index                                 query            leafId   type  \\\n",
+      "0  23590751                   spark plug wire end    [100000198354]  query   \n",
+      "1  19376999          outside electric cover plate  [104128, 104127]  query   \n",
+      "2   9005380  carpet item #435137 model 7l52200716          [100601]  query   \n",
+      "3  13877261      genova 1-1/4-in x 3/4-in adapter          [204499]  query   \n",
+      "4  11006357                           dg wm3500cw          [101381]  query   \n",
+      "\n",
+      "        labels  target  \n",
+      "0        [392]     392  \n",
+      "1  [1207, 528]     528  \n",
+      "2       [2656]    2656  \n",
+      "3       [2463]    2463  \n",
+      "4       [1653]    1653  \n"
+     ]
+    }
+   ],
+   "source": [
+    "from functools import reduce\n",
+    "import random\n",
+    "from multiprocessing import Pool\n",
+    "\n",
+    "import numpy as np\n",
+    "import json\n",
+    "from query_nn_keras_small_multi import get_keras_model\n",
+    "import pandas as pd\n",
+    "import swifter\n",
+    "import tensorflow as tf\n",
+    "import tensorflow.compat.v1.keras.backend as K\n",
+    "#from tensorflow.keras.backend.tensorflow_backend import set_session\n",
+    "\n",
+    "from tensorflow.keras.callbacks import TensorBoard, CSVLogger, ModelCheckpoint, EarlyStopping\n",
+    "from tensorflow.keras.utils import Sequence\n",
+    "from functools import reduce\n",
+    "# tf.enable_eager_execution()\n",
+    "from query_cnn import get_estimator\n",
+    "from collections import Counter\n",
+    "from config import config\n",
+    "from tensorflow.keras.callbacks import Callback\n",
+    "from tensorflow.keras.models import load_model, save_model\n",
+    "\n",
+    "\n",
+    "with open(\"./model_file/leafID-label.json\", \"r\") as f:\n",
+    "    lid = json.load(f)\n",
+    "    \n",
+    "# df[\"labels\"] = [json.loads(y) for y in df[\"labels\"]]\n",
+    "print(df.head())\n",
+    "\n",
+    "# Split train/test set\n",
+    "# df = df.sample(frac=1).reset_index(drop=True)\n",
+    "dev_sample_index = -1 * int(0.1 * float(df.shape[0]))\n",
+    "df_, df_dev = df[:dev_sample_index].reset_index(drop=True), df[dev_sample_index:].reset_index(drop=True)\n",
+    "test_sample_index = -1 * int(0.01 * float(df_.shape[0]))\n",
+    "df_train, df_test = df_[:test_sample_index].reset_index(drop=True), df_[test_sample_index:].reset_index(drop=True)\n",
+    "\n",
+    "class DataGenerator(Sequence):\n",
+    "    def __init__(self,\n",
+    "                 df,\n",
+    "                 batch_size,\n",
+    "                 cat_count,\n",
+    "                 dim=10,\n",
+    "                 cq_split=0.5,\n",
+    "                 train=True,\n",
+    "                 steps=None):\n",
+    "        self.batch_size = batch_size\n",
+    "        self.df = df\n",
+    "        self.steps = steps\n",
+    "        self.train = train\n",
+    "        self.dim = dim\n",
+    "        self.cq_split = cq_split\n",
+    "        self.cat_count = cat_count\n",
+    "        self.category = df.target.unique().tolist()\n",
+    "        \n",
+    "        print(\"category count\", len(self.category), self.cat_count)\n",
+    "    \n",
+    "    def __len__(self):\n",
+    "        return self.steps or self.df.shape[0] // self.batch_size \n",
+    "    \n",
+    "    def rnum(self, cnt, start, end, exclude=[]):\n",
+    "        iindex = []\n",
+    "        \n",
+    "        while len(iindex) < cnt:\n",
+    "            num = random.randint(start, end)\n",
+    "            if num not in iindex and num not in exclude:\n",
+    "                iindex.append(num)\n",
+    "        return iindex\n",
+    "        \n",
+    "    \n",
+    "    def get_cpi(self, category, num):\n",
+    "        \n",
+    "        temp = self.df[ self.df[\"target\"] == category]\n",
+    "        \n",
+    "        ind1 = temp[(temp[\"type\"] == \"query\") ].index.tolist()\n",
+    "        if len(ind1) >= num:\n",
+    "            ind1 = [ind1[ random.randint(0, len(ind1)-1) ] for x in range(num)]\n",
+    "            \n",
+    "        ind2 = temp[ (temp[\"type\"] == \"catalogue\") ].index.tolist()\n",
+    "        if len(ind2) >= num:\n",
+    "            ind2 = [ind2[ random.randint(0, len(ind2)-1) ] for x in range(num)]\n",
+    "            \n",
+    "        if len(ind1) + len(ind2) != 2*num:\n",
+    "            ind = temp.index.tolist()\n",
+    "            ind = [ind[ random.randint(0, len(ind)-1) ] for x in range(num)]\n",
+    "        else:\n",
+    "            s1 = int(num * self.cq_split)\n",
+    "            s2 = num - s1\n",
+    "            ind = ind1[:s1] + ind2[:s2]\n",
+    "            \n",
+    "        assert len(ind) == num\n",
+    "        \n",
+    "        payload = []\n",
+    "        \n",
+    "        for ival in ind:\n",
+    "            vec = self.df.loc[ival, \"X\"].split()\n",
+    "#             vec = [random.randint(0, 100)] * 6\n",
+    "            vec = vec[:self.dim]\n",
+    "            vec = vec + [0]*(self.dim - len(vec))\n",
+    "            target = np.zeros((self.cat_count,))\n",
+    "            for yind in self.df.loc[ival, \"labels\"]:\n",
+    "                target[yind] = 1\n",
+    "            payload.append((vec, target))\n",
+    "            \n",
+    "        return payload\n",
+    "    \n",
+    "    def __getitem__(self, index):\n",
+    "        try:\n",
+    "            if self.train:\n",
+    "                num = pow(2, random.randint(2, 6))\n",
+    "                random.shuffle(self.category)\n",
+    "                categories = self.category[:int(self.batch_size//num)]\n",
+    "                payload = []\n",
+    "                for category in categories:\n",
+    "                    payload += self.get_cpi(category, num=num)\n",
+    "                random.shuffle(payload)\n",
+    "\n",
+    "                anchor = np.array([np.array(i[0]) for i in payload])\n",
+    "                target = np.array([np.array(i[1]) for i in payload])\n",
+    "                del payload\n",
+    "                anchor = anchor.astype('float32')\n",
+    "                target = target.astype(\"float32\")\n",
+    "\n",
+    "                return anchor, target\n",
+    "            else:\n",
+    "                start = index * self.batch_size\n",
+    "                end = (index+1) * self.batch_size - 1\n",
+    "                if end > self.df.shape[0]-1:\n",
+    "                    start = 0\n",
+    "                    end = self.batch_size - 1\n",
+    "                anchor = self.df.loc[start:end, \"X\"].to_list()\n",
+    "                anchor = np.array([y[:self.dim] + [0]*(self.dim-len(y[:self.dim])) for y in anchor]).astype(\"float32\")\n",
+    "                target = np.zeros((self.batch_size, self.cat_count))\n",
+    "                for k, x in enumerate(self.df.loc[start:end, \"labels\"]):\n",
+    "                    for xind in x:\n",
+    "                        target[k, xind] = 1\n",
+    "                target = target.astype(\"float32\")\n",
+    "                return anchor, target\n",
+    "        except Exception as e:\n",
+    "            print(e)\n",
+    "            raise e\n",
+    "            return self[index]\n",
+    "        \n",
+    "    def on_epoch_end(self):\n",
+    "        if not self.train:\n",
+    "            self.df = self.df.sample(frac=1).reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 234,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cat_count ::  3589\n",
+      "category count 3583 3589\n",
+      "category count 3016 3589\n"
+     ]
+    }
+   ],
+   "source": [
+    "cat_count = len(lid)\n",
+    "print(\"cat_count :: \", cat_count)\n",
+    "train_dg = DataGenerator(df_train, batch_size=2048, cat_count=cat_count, train=True, steps=2000)\n",
+    "test_dg = DataGenerator(df_test, batch_size=2048, cat_count=cat_count, train=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 245,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x = train_dg[1]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 236,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "(2048, 10)"
+      ]
+     },
+     "execution_count": 236,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "x[0].shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 237,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "array([[78., 78., 78., 78., 78., 78.,  0.,  0.,  0.,  0.],\n",
+       "       [61., 61., 61., 61., 61., 61.,  0.,  0.,  0.,  0.],\n",
+       "       [ 8.,  8.,  8.,  8.,  8.,  8.,  0.,  0.,  0.,  0.],\n",
+       "       [80., 80., 80., 80., 80., 80.,  0.,  0.,  0.,  0.],\n",
+       "       [ 4.,  4.,  4.,  4.,  4.,  4.,  0.,  0.,  0.,  0.],\n",
+       "       [58., 58., 58., 58., 58., 58.,  0.,  0.,  0.,  0.],\n",
+       "       [20., 20., 20., 20., 20., 20.,  0.,  0.,  0.,  0.],\n",
+       "       [21., 21., 21., 21., 21., 21.,  0.,  0.,  0.,  0.],\n",
+       "       [59., 59., 59., 59., 59., 59.,  0.,  0.,  0.,  0.],\n",
+       "       [50., 50., 50., 50., 50., 50.,  0.,  0.,  0.,  0.]], dtype=float32)"
+      ]
+     },
+     "execution_count": 237,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "x[0][:10]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 242,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "array([2887, 2050, 1489,  906,  973, 1191, 1495, 2384, 2261, 1495])"
+      ]
+     },
+     "execution_count": 242,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "np.argmax(x[1][:10], axis=1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 259,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0"
+      ]
+     },
+     "execution_count": 259,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "random.randint(0, 0)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "####  ----------------------------------------------------------------------------------------------------------"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 137,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "32"
+      ]
+     },
+     "execution_count": 137,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "pow(2, random.randint(1, 5))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import re\n",
+    "tokens = []\n",
+    "with tqdm(train_data[\"query\"]) as iter_:\n",
+    "    for x in iter_:\n",
+    "        tokens += [x.strip().lower().replace(\"'\", \"\").replace('\"', \"\") for x in re.split(r\"[-\\s]\",\n",
+    "                                                                x.replace(\"/\", \" \")) if x != \"\"]\n",
+    "    \n",
+    "tokens = list(set(tokens))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(\"./model_file/glove.42B.tokens.txt\") as f:\n",
+    "    glove_token = f.read().split(\"\\n\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tmapper = dict([(t, k) for k, t in enumerate(glove_token)])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def vectorize(query):\n",
+    "    query = query.replace('\\\\', \"\").replace(\"/\", \" \").replace(\"'\", \"\").replace('\"', \"\")\n",
+    "    query = [x.strip().lower() for x in re.split(r\"[\\s-]\", query) if x != \"\"]\n",
+    "    vec = []\n",
+    "    for q in query:\n",
+    "        vec.append(tmapper.get(q, 0))\n",
+    "    return \" \".join([str(y) for y in vec])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data[\"X\"] = train_data[\"query\"].swifter.apply(lambda x: vectorize(x))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [],
+   "source": [
+    "train_data.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data[[len(x) == 1 for x in train_data[\"label\"]]].shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "len(glove_token)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = train_data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df.to_csv(\"./model_file/multi_df.csv\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Split train/test set\n",
+    "dev_sample_index = -1 * int(0.1 * float(df.shape[0]))\n",
+    "df_, df_dev = df[:dev_sample_index].reset_index(drop=True), df[dev_sample_index:].reset_index(drop=True)\n",
+    "test_sample_index = -1 * int(0.01 * float(df_.shape[0]))\n",
+    "df_train, df_test = df_[:test_sample_index].reset_index(drop=True), df_[test_sample_index:].reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "dfs = df_train\n",
+    "dfs = dfs.reset_index().rename(columns={\"index\": \"cnt\"})\n",
+    "dfs[\"X\"] = [[int(y) for y in x.split()] for x in dfs[\"X\"]]\n",
+    "dfs[\"combined\"] = dfs[[\"cnt\", \"X\"]].values.tolist()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# generate mapper file"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tqdm import tqdm"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import swifter\n",
+    "def func(z):\n",
+    "    return [(x, z[0]) for x in [x for x in z[1] if x != 0]]\n",
+    "word_tuple = dfs[\"combined\"].swifter.apply(func)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "rwt = []\n",
+    "with tqdm(word_tuple) as iter_:\n",
+    "    for x in iter_:\n",
+    "        rwt += x\n",
+    "len(rwt)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mapper = pd.DataFrame(data=rwt, columns=[\"word\", \"query\"])\n",
+    "mapper = mapper.groupby(\"word\").agg({\"query\": list}).reset_index(drop=False)\n",
+    "mapper[\"qcount\"] = [len(x) for x in mapper[\"query\"]]\n",
+    "mapper = mapper.sort_values(\"qcount\", ascending=False).reset_index(drop=True)\n",
+    "mapper.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mapper[\"wvalue\"] =[glove_token[x] for x in  mapper[\"word\"]]\n",
+    "mapper.qcount.describe()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mapper = mapper[mapper[\"qcount\"] > 3]\n",
+    "mapper = mapper[mapper[\"qcount\"] < 1e+6]\n",
+    "mapper = mapper.reset_index(drop=True)\n",
+    "mapper.shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "avail_index = [0]*df_train.shape[0]\n",
+    "for x in mapper[\"query\"]:\n",
+    "    for y in x:\n",
+    "        avail_index[y] = 1\n",
+    "len([k for k, x in enumerate(avail_index) if x == 0])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "mapper.to_csv(\"model_file/multi_mapper.csv\", index=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# load mapper "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "with open(\"./model_file/glove.42B.tokens.txt\") as f:\n",
+    "    glove_token = f.read().split(\"\\n\")\n",
+    "    \n",
+    "import json\n",
+    "    \n",
+    "l3 = pd.read_csv(\"./model_file/l3_deps.csv\")\n",
+    "\n",
+    "df = pd.read_csv(\"./model_file/multi_df.csv\")\n",
+    "df[\"X\"] = df[\"X\"].fillna(\"\").swifter.apply(lambda x: [int(y) for y in str(x).split()])\n",
+    "\n",
+    "df[\"Y\"] = [json.loads(y) for y in df[\"label\"]]\n",
+    "print(df.head())\n",
+    "\n",
+    "# Split train/test set\n",
+    "dev_sample_index = -1 * int(0.1 * float(df.shape[0]))\n",
+    "df_, df_dev = df[:dev_sample_index].reset_index(drop=True), df[dev_sample_index:].reset_index(drop=True)\n",
+    "test_sample_index = -1 * int(0.01 * float(df_.shape[0]))\n",
+    "df_train, df_test = df_[:test_sample_index].reset_index(drop=True), df_[test_sample_index:].reset_index(drop=True)\n",
+    "\n",
+    "mapper = pd.read_csv(\"model_file/multi_mapper.csv\")\n",
+    "mapper[\"query\"] = [json.loads(x) for x in mapper[\"query\"]]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tensorflow.keras.utils import Sequence"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class DataGenerator(Sequence):\n",
+    "    def __init__(self,\n",
+    "                 df,\n",
+    "                 batch_size,\n",
+    "                 cat_count,\n",
+    "                 train=True,\n",
+    "                 mapper=None,\n",
+    "                 steps=None):\n",
+    "        self.batch_size = batch_size\n",
+    "        self.df = df\n",
+    "        self.steps = steps\n",
+    "        self.train = train\n",
+    "        if mapper is not None:\n",
+    "            self.mapper = mapper\n",
+    "            self.mapper = self.mapper.set_index(\"word\")\n",
+    "            self.words = self.mapper.index.to_list()\n",
+    "        self.category = list(range(cat_count))\n",
+    "        \n",
+    "        print(\"category count\", len(self.category))\n",
+    "    \n",
+    "    def __len__(self):\n",
+    "        return self.steps or self.df.shape[0] // self.batch_size \n",
+    "    \n",
+    "    def rnum(self, cnt, start, end, exclude=[]):\n",
+    "        iindex = []\n",
+    "        \n",
+    "        while len(iindex) < cnt:\n",
+    "            num = random.randint(start, end)\n",
+    "            if num not in iindex and num not in exclude:\n",
+    "                iindex.append(num)\n",
+    "        return iindex\n",
+    "        \n",
+    "    \n",
+    "    def get_cpi(self, word, num):\n",
+    "        ind = self.mapper.loc[word, \"query\"]\n",
+    "        ind = [ind[i] for i in [random.randint(0, len(ind)-1) for x in range(num)]]\n",
+    "        \n",
+    "        payload = []\n",
+    "        \n",
+    "        for ival in ind:\n",
+    "            vec = self.df.loc[ival, \"X\"][:10]\n",
+    "            vec = vec + [0]*(10 - len(vec))\n",
+    "#             assert word in vec\n",
+    "#             vec = np.array(vec)\n",
+    "            target = np.zeros((len(self.category),))\n",
+    "            for yind in self.df.loc[ival, \"Y\"]:\n",
+    "                target[yind] = 1\n",
+    "            payload.append((vec, target))\n",
+    "            \n",
+    "        return payload\n",
+    "    \n",
+    "    def __getitem__(self, index):\n",
+    "        try:\n",
+    "            if self.train:\n",
+    "                num = 32\n",
+    "                random.shuffle(self.words)\n",
+    "                words = self.words[:int(self.batch_size//num)]\n",
+    "                payload = []\n",
+    "                for word in words:\n",
+    "                    payload += self.get_cpi(word, num=num)\n",
+    "                random.shuffle(payload)\n",
+    "                anchor = np.array([np.array(i[0]) for i in payload])\n",
+    "                target = np.array([np.array(i[1]) for i in payload])\n",
+    "                return payload\n",
+    "                del payload\n",
+    "                anchor = anchor.astype('float32')\n",
+    "                target = target.astype(\"float32\")\n",
+    "\n",
+    "                return anchor, target\n",
+    "            else:\n",
+    "                start = index * self.batch_size\n",
+    "                end = (index+1) * self.batch_size - 1\n",
+    "                if end > self.df.shape[0]-1:\n",
+    "                    start = 0\n",
+    "                    end = self.batch_size - 1\n",
+    "                anchor = self.df.loc[start:end, \"X\"].to_list()\n",
+    "                anchor = np.array([y + [0]*(10-len(y)) for y in anchor]).astype(\"float32\")\n",
+    "                target = np.zeros((self.batch_size, len(self.category)))\n",
+    "                for k, x in enumerate(self.df.loc[start:end, \"Y\"]):\n",
+    "                    for xind in x:\n",
+    "                        target[k, xind] = 1\n",
+    "                target = target.astype(\"float32\")\n",
+    "                return anchor, target\n",
+    "        except Exception as e:\n",
+    "            print(e)\n",
+    "            raise e\n",
+    "            return self[index]\n",
+    "        \n",
+    "    def on_epoch_end(self):\n",
+    "        if not self.train:\n",
+    "            self.df = self.df.sample(frac=1).reset_index(drop=True)\n",
+    "            \n",
+    "cat_count = l3.shape[0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_dg = DataGenerator(df_train, batch_size=2048, cat_count=cat_count, train=True, mapper=mapper)\n",
+    "test_dg = DataGenerator(df_test, batch_size=2048, cat_count=cat_count, train=False, mapper=None)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x = train_dg[0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "np.array([x[0] for x in x]).shape"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "len([y for y in x[0] if len(y) > 10][0])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "np.where(x[1][31:50] == 1)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# model training"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# from query_nn_keras import get_keras_model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# cat_count = 3000"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tensorflow.keras.utils import plot_model\n",
+    "from tensorflow.keras.models import Model\n",
+    "from tensorflow.keras.layers import Input,Embedding, Dense, LSTM, Conv2D, MaxPool2D, MaxPool1D, Bidirectional, TimeDistributed, GRU, Activation, Dropout\n",
+    "from tensorflow.keras.layers import multiply,Reshape,Flatten,Concatenate,RepeatVector, Permute\n",
+    "from tensorflow.keras.optimizers import Adam\n",
+    "from tensorflow.keras.regularizers import L1L2\n",
+    "import numpy as np\n",
+    "\n",
+    "def acc(y_true, y_pred):\n",
+    "    targets = tf.argmax(y_true, 1)\n",
+    "    predictions = tf.argmax(y_pred, 1)\n",
+    "    correct_predictions = tf.equal(predictions, targets)\n",
+    "    accuracy = tf.reduce_mean(tf.cast(correct_predictions, \"float\"), name=\"accuracy\")\n",
+    "    return accuracy\n",
+    "    \n",
+    "def acc_3(y_true, y_pred):\n",
+    "    targets = tf.argmax(y_true, 1)\n",
+    "    correct_predictions_top_3 = tf.math.in_top_k(y_pred, targets, 3, name=None)\n",
+    "    print(y_pred[0])\n",
+    "    accuracy_3 = tf.reduce_mean(tf.cast(correct_predictions_top_3,\"float\"), name=\"accuracy_3\")\n",
+    "    return accuracy_3\n",
+    "    \n",
+    "def acc_5(y_true, y_pred):\n",
+    "    targets = tf.argmax(y_true, 1)\n",
+    "    correct_predictions_top_5 = tf.math.in_top_k(y_pred, targets, 5, name=None)\n",
+    "    accuracy_5 = tf.reduce_mean(tf.cast(correct_predictions_top_5,\"float\"), name=\"accuracy_5\")\n",
+    "    return accuracy_5\n",
+    " \n",
+    "def acc_9(y_true, y_pred):\n",
+    "    targets = tf.argmax(y_true, 1)\n",
+    "    correct_predictions_top_9 = tf.math.in_top_k(y_pred, targets, 9, name=None)\n",
+    "    accuracy_9 = tf.reduce_mean(tf.cast(correct_predictions_top_9,\"float\"), name=\"accuracy_9\")\n",
+    "    return accuracy_9\n",
+    "\n",
+    "def loss(y_true, y_pred):\n",
+    "    losses = tf.compat.v1.nn.softmax_cross_entropy_with_logits_v2(logits=y_pred, labels=y_true)\n",
+    "    loss = tf.reduce_mean(losses)\n",
+    "    return loss\n",
+    "\n",
+    "def cnn_rnn_model(params):\n",
+    "\n",
+    "    max_token_len = params['max_token_len']\n",
+    "    l2_reg_lambda = params['l2_reg_lambda']\n",
+    "    L2 = L1L2(l2=l2_reg_lambda)\n",
+    "    inputs = Input(shape=(max_token_len,), dtype='int32')\n",
+    "\n",
+    "    # Embedding\n",
+    "    vocab_size = params['vocab_size']\n",
+    "    embedding_size = params['embedding_size']\n",
+    "    glove_vec = np.load(\"./model_file/glove_vec_wp.100d.npy\")\n",
+    "    print(glove_vec.shape, vocab_size, embedding_size)\n",
+    "    embedding = Embedding(input_dim=vocab_size, output_dim=embedding_size,\n",
+    "                          input_length=max_token_len, weights=[glove_vec], trainable=False)(inputs)\n",
+    "\n",
+    "    x = Bidirectional (LSTM (256, return_sequences=True, dropout=0), merge_mode='concat')(embedding)\n",
+    "    x = Bidirectional (LSTM (256, return_sequences=True, dropout=0), merge_mode='concat')(x)\n",
+    "    x = TimeDistributed(Dense(512,activation='elu'))(x)\n",
+    "    x = Flatten()(x)\n",
+    "    x = Dense(4096,activation='elu')(x)\n",
+    "    \n",
+    "    num_classes = params['num_classes']\n",
+    "    output = Dense(num_classes, activation='softmax')(x)\n",
+    "    \n",
+    "    model = Model(inputs=inputs, outputs=output)\n",
+    "    adam = Adam(lr=params['learning_rate'], beta_1=0.9, beta_2=0.999, epsilon=params['epsilon'], decay=0.0)\n",
+    "    model.compile(optimizer=adam, loss=loss, metrics=[acc, acc_3, acc_5, acc_9])\n",
+    "    return model\n",
+    "\n",
+    "def get_keras_model(freq,label_cnt=3954):\n",
+    "    params = {}\n",
+    "    params['learning_rate'] = 1e-2\n",
+    "    params['epsilon'] = 1e-8\n",
+    "\n",
+    "    params['vocab_size'] = 1917497 # glove vocabulary size\n",
+    "    params['filter_sizes'] = [2,3,4] # related to ngrams\n",
+    "    params['num_filters'] = 128*2 # hidden units\n",
+    "    params['num_dense_units'] = [640*2,640*2,640, 320]\n",
+    "    params['embedding_size'] = 100\n",
+    "    params['num_classes'] = label_cnt # number of departments with varying levels\n",
+    "    params['attention_depth'] = 3\n",
+    "    params['attention_size'] = 128\n",
+    "    params['dropout_keep_prob'] = 0.7\n",
+    "    params['max_token_len'] = 10\n",
+    "    params['l2_reg_lambda'] = 10.0\n",
+    "    model = cnn_rnn_model(params)\n",
+    "\n",
+    "    print(model.summary())\n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "model = get_keras_model(None, cat_count)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "history = model.fit_generator(\n",
+    "                    train_dg,\n",
+    "                    steps_per_epoch=500,\n",
+    "                    validation_data=test_dg,\n",
+    "                    validation_steps=10,\n",
+    "                    epochs=1,\n",
+    "                    max_queue_size=100,\n",
+    "                    workers=1,\n",
+    "                    use_multiprocessing=False,\n",
+    "                    initial_epoch=0,\n",
+    "                    callbacks=None)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tf.re"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# generator "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def map_to_index(x):\n",
+    "    xs, label_index = x\n",
+    "    for l in label_index:\n",
+    "        shuffle(label_index[l])\n",
+    "    for x in xs:\n",
+    "        shuffle(x)\n",
+    "    labels = reduce(lambda a,b: a+b, xs, [])\n",
+    "    mlabels = []\n",
+    "    mlabel_pointer = dict([(l, 0) for l in label_index])\n",
+    "    for l in labels:\n",
+    "        mlabels.append( label_index[l][ mlabel_pointer[l] % len(label_index[l]) ] )\n",
+    "        mlabel_pointer[l] += 1\n",
+    "    return mlabels\n",
+    "\n",
+    "def input_fn(dfs, batch_size, training=True, pred=False):\n",
+    "    \n",
+    "    \n",
+    "    def generator():\n",
+    "        sample_per_case = 4\n",
+    "        cases = batch_size // sample_per_case\n",
+    "        number_of_batches = dfs.shape[0]//batch_size\n",
+    "        labels = word_tuple.index.tolist()\n",
+    "\n",
+    "        label_index = {}\n",
+    "        for y in labels:\n",
+    "            val = word_tuple.loc[y, \"indx\"]\n",
+    "            shuffle(val)\n",
+    "            label_index[y] = val\n",
+    "\n",
+    "        while True:\n",
+    "            if training:\n",
+    "                print(\"Creating new batch in train\")\n",
+    "                labels_b = [np.random.choice(labels, size=cases, replace=False).tolist() * sample_per_case\n",
+    "                            for _ in range(number_of_batches)]\n",
+    "\n",
+    "                perjob = list(range(0, len(labels_b), 2000))\n",
+    "                if len(perjob) == 0:\n",
+    "                    perjob.append(0)\n",
+    "                perjob.append(len(labels_b))\n",
+    "                perjob = list(zip(perjob[:-1], perjob[1:]))\n",
+    "                perjob = [(labels_b[z[0]: z[1]], label_index) for z in perjob]\n",
+    "\n",
+    "                with Pool(14) as pool:\n",
+    "                    labels_b = pool.map(map_to_index, perjob)\n",
+    "                print(\"Done\")\n",
+    "            else:\n",
+    "                print(\"Creating new batch in test\")\n",
+    "                labels_b = [list(dfs.index)]\n",
+    "\n",
+    "            for x in labels_b:\n",
+    "                for y in x:\n",
+    "                    yield ((dfs.loc[y, \"X\"], dfs.loc[y, \"freq\"]), dfs.loc[y, \"Y\"])\n",
+    "\n",
+    "    datasets = tf.data.Dataset.from_generator(generator,\n",
+    "                                              ((tf.int64, tf.int64), tf.int64),\n",
+    "                                             ((tf.TensorShape([None]), tf.TensorShape([])), tf.TensorShape([])))\n",
+    "    datasets = datasets.batch(batch_size)\n",
+    "    return datasets\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import tensorflow as tf\n",
+    "tf.enable_eager_execution()\n",
+    "import numpy as np"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x = np.array([[1,0,1],\n",
+    "            [0,1,0]])"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "a,b = tf.math.top_k(x, k=2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "a.numpy()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "b.numpy()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "[x for x in tf.split(b, b.shape[0], axis=0)]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "tf.argmax(x, axis=1).numpy()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "l3 = pd.read_csv(\"gs://gcp-ushi-search-platform-npe/ashwin/dev/cats.csv\", header=None, names=[\"leafId\"])\n",
+    "civm = pd.read_csv(\"gs://gcp-ushi-search-platform-npe/ashwin/dev/ivm-cat.csv\")\n",
+    "clabel = 3026\n",
+    "\n",
+    "l3c = pd.merge(l3, civm[[\"Departments_Depth\", \"leafId\"]], on =\"leafId\", how=\"left\").drop_duplicates()\n",
+    "l3c[\"Departments_Depth\"] = [str(x).split(\",\")[-1] for x in l3c[\"Departments_Depth\"]]\n",
+    "l3c = l3c.reset_index(drop=True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "l3c.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x = pd.read_csv(\"./model_file/multi_df.csv\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "x.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "l3c.loc[140]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.7.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
